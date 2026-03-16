@@ -32,7 +32,7 @@ Add to your `Packages/manifest.json`:
 ```json
 {
   "dependencies": {
-    "com.sputnicyoji.frame-dump": "https://github.com/sputnicyoji/unity-frame-dump.git"
+    "com.sputnicyoji.unity-frame-dump": "https://github.com/sputnicyoji/unity-frame-dump.git"
   }
 }
 ```
@@ -49,7 +49,7 @@ Clone this repo into your project's `Packages/` folder:
 
 ```bash
 cd YourProject/Packages
-git clone https://github.com/sputnicyoji/unity-frame-dump.git com.sputnicyoji.frame-dump
+git clone https://github.com/sputnicyoji/unity-frame-dump.git com.sputnicyoji.unity-frame-dump
 ```
 
 ## Usage
@@ -246,64 +246,133 @@ Unity 的 Frame Debugger 是纯 GUI 工具 -- 可以看 draw call，但没有公
 
 ## 安装
 
-`Packages/manifest.json`:
+提供三种安装方式，任选其一：
+
+### 方式一：Unity Package Manager (推荐)
+
+1. 打开 Unity 菜单: `Window > Package Manager`
+2. 点击左上角 **+** 按钮
+3. 选择 **Add package from git URL...**
+4. 粘贴以下地址：
+
+```
+https://github.com/sputnicyoji/unity-frame-dump.git
+```
+
+5. 点击 **Add**，等待导入完成
+
+### 方式二：手动编辑 manifest.json
+
+打开项目的 `Packages/manifest.json`，在 `dependencies` 中添加一行：
 
 ```json
 {
   "dependencies": {
-    "com.sputnicyoji.frame-dump": "https://github.com/sputnicyoji/unity-frame-dump.git"
+    "com.sputnicyoji.unity-frame-dump": "https://github.com/sputnicyoji/unity-frame-dump.git",
+    "...": "..."
   }
 }
 ```
 
-或: `Window > Package Manager > + > Add package from git URL`
+保存后 Unity 会自动下载并导入。
 
-## 使用
+### 方式三：克隆到本地 (离线使用)
 
-1. 开 Frame Debugger: `Window > Analysis > Frame Debugger` > **Enable**
-2. 开导出器: `Tools > Performance > Frame Debugger Exporter`
-3. 首次点 **Diagnose Limit Setter** 检查兼容性
-4. 点 **Full Export** 导出
-5. JSON 给 AI 分析
+```bash
+cd YourProject/Packages
+git clone https://github.com/sputnicyoji/unity-frame-dump.git com.sputnicyoji.unity-frame-dump
+```
 
-### 诊断结果
+克隆后 Unity 会自动识别 `Packages/` 下的嵌入式包，无需修改 `manifest.json`。
 
-- **PASS** (绿) -- OK
-- **FAIL** (红) -- 查看详情
+### 安装后验证
 
-| 检查项 | 内容 |
-|------|------|
-| API Binding | 反射找 `FrameDebuggerUtility` |
-| count/limit | 属性可读 |
-| Limit Setter | GPU 游标可写 |
-| GPU Replay | 回放后可读数据 |
-| Field Name | 嵌套字段可读 |
+安装成功后，菜单栏会出现: `Tools > Performance > Frame Debugger Exporter`
 
-### 自检
+如果看不到这个菜单，检查 Console 是否有编译错误。
 
-导出时探测 4 维度 (顶点/Shader/状态/属性)，异常时 Console + `root.issues` 报警。
+## 使用方法
+
+### 第一步：开启 Frame Debugger
+
+1. 菜单: `Window > Analysis > Frame Debugger`
+2. 点击 **Enable** 开始捕获
+3. 游戏会暂停，导航到你想分析的帧
+
+### 第二步：打开导出器
+
+菜单: `Tools > Performance > Frame Debugger Exporter`
+
+### 第三步：诊断 (首次使用建议执行)
+
+点击 **Diagnose Limit Setter**，检查工具是否兼容当前 Unity 版本。
+
+结果会用颜色标注：
+
+- **PASS** (绿色) -- 检查通过
+- **FAIL** (红色) -- 有问题，查看右侧详情
+
+| 检查项 | 检测内容 | 失败说明 |
+|------|------|------|
+| API Binding | 反射找 `FrameDebuggerUtility` | Unity 版本不兼容 |
+| count/limit | 事件数/回放游标可读 | 属性被移除或重命名 |
+| Limit Setter | GPU 回放游标可写 | 异步导出的 detail 数据可能为空 |
+| GPU Replay | 回放后能读到事件数据 | 回放机制变化 |
+| Field Name | 嵌套结构体字段可读 | 内部字段名变化，需更新代码 |
+
+### 第四步：导出
+
+| 按钮 | 速度 | 输出内容 | 适用场景 |
+|------|------|------|------|
+| **Quick Export** | 立即 | 事件名、类型、GameObject | 快速概览 |
+| **Full Export** | ~1s/事件 | Shader/状态/RT/属性等完整详情 | 深度分析 |
+
+输出文件保存在: `{项目根目录}/FrameDebuggerExports/fd_{mode}_{timestamp}.json`
+
+导出完成后，窗口底部会显示 **Open File** 和 **Reveal in Explorer** 按钮。
+
+### 第五步：AI 分析
+
+将导出的 JSON 文件提供给 AI 工具 (Claude, ChatGPT 等)，示例提问：
+
+> "分析这个帧数据。找出前 3 个渲染瓶颈并建议优化方案。"
+
+清洗后的数据专为 AI 分析设计 -- Shader 分布、Batch Break 原因、RT 时间线、逐事件详情均已结构化。
+
+## 数据自检
+
+导出时自动探测前 5 个绘制事件的 4 个维度：
+
+| 维度 | 探测字段 | 全零说明什么 |
+|------|------|------|
+| 顶点 | `m_VertexCount > 0` | 几何数据字段名变了 |
+| Shader | `m_RealShaderName` 非空 | Shader 名称字段被重命名 |
+| 渲染状态 | blend/raster 值非默认 | 嵌套状态结构体字段名变了 |
+| Shader 属性 | textures/vectors 非空 | `m_ShaderInfo` 结构变了 |
+
+异常时 Console 和 JSON `root.issues` 同时报警。无 `issues` 字段 = 数据健康。
 
 ## 兼容性
 
-| Unity | |
-|-------|------|
-| 2022.3 LTS | ✅ |
+| Unity 版本 | 状态 |
+|---------|------|
+| 2022.3 LTS | ✅ 已测试 |
 | 2021.3 LTS | 预期可用 |
 | 2020.3 LTS | 预期可用 |
-| Unity 6+ | 可能需更新 |
+| Unity 6+ | 可能需要更新字段名 |
 
-## 原理
+## 工作原理
 
-反射 `FrameDebuggerUtility` 内部 API:
+通过 `System.Reflection` 访问 Unity 内部类 `UnityEditorInternal.FrameDebuggerUtility`：
 
-1. `GetFrameEvents()` 获取事件
-2. `limit = i+1` 移动游标
-3. `RepaintAllViews()` 触发回放
-4. 等 2 帧
-5. `GetFrameEventData(i)` 读数据
-6. 清洗输出
+1. `GetFrameEvents()` -- 获取所有事件
+2. `limit = i + 1` -- 移动 GPU 回放游标
+3. `RepaintAllViews()` -- 触发 GPU 重新回放
+4. 等待 2 个编辑器帧
+5. `GetFrameEventData(i)` -- 读取已填充的事件数据
+6. 清洗并输出结构化 JSON
 
-`FieldInfo` 全缓存。零堆分配。
+所有 `FieldInfo` 查找均已缓存。热路径零堆分配。
 
 ## License
 

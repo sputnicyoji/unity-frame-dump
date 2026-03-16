@@ -1,5 +1,5 @@
 {
-  "name": "com.sputnicyoji.frame-dump",
+  "name": "com.sputnicyoji.unity-frame-dump",
   "version": "1.0.0",
   "displayName": "Frame Debugger Exporter",
   "description": "Export Unity Frame Debugger data to structured JSON for AI-assisted rendering analysis.",
