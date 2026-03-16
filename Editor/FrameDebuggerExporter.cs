@@ -11,7 +11,7 @@ using UnityEngine;
 /// <summary>
 /// Frame Debugger data exporter.
 /// Reflects into FrameDebuggerUtility (internal API) to export per-event rendering data as JSON.
-/// Tested on Unity 2022.3.62f2c1 (custom build).
+/// Tested on Unity 2022.3 LTS.
 /// API lives in: UnityEditorInternal.FrameDebuggerInternal.FrameDebuggerUtility
 /// Menu: Tools/Performance/Frame Debugger Exporter
 /// </summary>
