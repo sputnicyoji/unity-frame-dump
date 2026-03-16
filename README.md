@@ -181,6 +181,7 @@ The clean schema is designed for this -- shader distribution, batch break causes
 - `Vector4` computed properties (normalized/magnitude)
 - Compute/ray tracing fields (all zeros if unused)
 - Instance IDs, shader matrices, buffers/cBuffers
+- Non-draw events (ClearAll, ClearDepthStencil, ResolveRT) do not output `state` or `props` -- their GPU state is inherited from the previous pass and has no analytical value
 
 ## Self-Check
 
