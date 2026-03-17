@@ -51,6 +51,9 @@ public class FrameDebuggerExporter : EditorWindow
     // Properties
     private PropertyInfo m_PropCount;
     private PropertyInfo m_PropLimit;
+    private MethodInfo m_SetLimitMethod;  // cached set_limit fallback
+    private PropertyInfo m_PropReceivingRemote; // receivingRemoteFrameEventData
+    private MethodInfo m_GetRemotePlayerGUID;   // stable remote connection check
 
     // Cached batch break cause lookup table
     private string[] m_BatchBreakCauseStrings;
@@ -133,13 +136,17 @@ public class FrameDebuggerExporter : EditorWindow
     private int m_AsyncIndex;
     private int m_AsyncEventCount;
     private int m_AsyncOriginalLimit;
-    private int m_AsyncPhase; // 0=set limit, 1=read data
+    private int m_AsyncPhase; // 0=set limit, 1..N=wait, N+1=try read, retry if empty
     private int m_AsyncDetailHits;
     private bool m_LimitSetterWorks;
     private Array m_AsyncFrameEventsArray;
     private StringBuilder m_AsyncSb;
     private JsonBuilder m_AsyncJson;
     private bool m_AsyncHeaderWritten;
+    private int m_AsyncRetryCount;      // current retry count for this event
+    private bool m_LastRemoteState;     // track remote state changes for auto-preset
+    private bool m_AsyncIsRemote;       // cached at export start
+    private double m_AsyncEventStartTime; // for per-event timeout
 
     #endregion
 
@@ -150,7 +157,11 @@ public class FrameDebuggerExporter : EditorWindow
         wnd.minSize = new Vector2(400, 300);
     }
 
-    private void OnEnable() => DiscoverTypes();
+    private void OnEnable()
+    {
+        DiscoverTypes();
+        m_LastRemoteState = IsRemoteConnected();
+    }
 
     private void OnDisable()
     {
@@ -197,6 +208,9 @@ public class FrameDebuggerExporter : EditorWindow
 
             m_PropCount = m_UtilType.GetProperty("count", s_Static);
             m_PropLimit = m_UtilType.GetProperty("limit", s_Static);
+            m_SetLimitMethod = m_UtilType.GetMethod("set_limit", s_Static);
+            m_PropReceivingRemote = m_UtilType.GetProperty("receivingRemoteFrameEventData", s_Static);
+            m_GetRemotePlayerGUID = m_UtilType.GetMethod("GetRemotePlayerGUID", s_Static);
 
             // Pre-cache batch break cause strings
             if (m_GetBatchBreakCauseStrings != null)
@@ -252,6 +266,41 @@ public class FrameDebuggerExporter : EditorWindow
             ReportIssue("prop-limit", $"Failed to read Frame Debugger limit: {e.GetType().Name}: {e.Message}");
             return 0;
         }
+    }
+
+    /// <summary>
+    /// Stable remote connection check via GetRemotePlayerGUID.
+    /// Returns true if Frame Debugger is connected to a remote device.
+    /// </summary>
+    private bool IsRemoteConnected()
+    {
+        if (m_GetRemotePlayerGUID == null) return false;
+        try
+        {
+            var guid = m_GetRemotePlayerGUID.Invoke(null, null);
+            if (guid == null) return false;
+            string s = guid.ToString();
+            // Empty or all-zero GUID = local
+            return !string.IsNullOrEmpty(s) && s != "0000000000000000"
+                && s != "00000000000000000000000000000000"
+                && s != "00000000-0000-0000-0000-000000000000";
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Returns true while device is actively transferring frame event data.
+    /// Use as data-readiness signal: wait for this to go false after triggering replay.
+    /// </summary>
+    private bool IsTransferringData()
+    {
+        if (m_PropReceivingRemote == null) return false;
+        try
+        {
+            var val = m_PropReceivingRemote.GetValue(null);
+            return val is bool b && b;
+        }
+        catch { return false; }
     }
 
     private bool TryValidateExportPrerequisites(bool requireDetailData, out string message)
@@ -460,13 +509,12 @@ public class FrameDebuggerExporter : EditorWindow
             }
         }
 
-        // Try 2: Direct set method (set_limit)
-        var setMethod = m_UtilType.GetMethod("set_limit", s_Static);
-        if (setMethod != null)
+        // Try 2: Direct set method (set_limit), cached in DiscoverTypes
+        if (m_SetLimitMethod != null)
         {
             try
             {
-                setMethod.Invoke(null, new object[] { value });
+                m_SetLimitMethod.Invoke(null, new object[] { value });
                 int readBack = GetLimit();
                 if (readBack == value) return true;
             }
@@ -536,8 +584,7 @@ public class FrameDebuggerExporter : EditorWindow
         {
             int limit = GetLimit();
             EditorGUILayout.HelpBox(
-                $"Frame Debugger: {count} events  |  Limit: {limit}\n" +
-                $"Type: {m_UtilType.FullName}",
+                $"Frame Debugger: {count} events  |  Limit: {limit}",
                 MessageType.Info);
 
             if (!TryValidateExportPrerequisites(true, out string fullExportIssue))
@@ -549,10 +596,45 @@ public class FrameDebuggerExporter : EditorWindow
         }
     }
 
+    private GUIStyle m_ModeLabelStyle;
+
     private void DrawOptions()
     {
-        // Clean export — all valuable fields included, depth fixed at 6.
-        // No configurable options needed.
+        // Auto-detect remote state change
+        bool isRemoteNow = IsRemoteConnected();
+        if (isRemoteNow != m_LastRemoteState)
+            m_LastRemoteState = isRemoteNow;
+
+        // Mode badge — bold, colored, full-width
+        if (m_ModeLabelStyle == null)
+        {
+            m_ModeLabelStyle = new GUIStyle(EditorStyles.boldLabel)
+            {
+                fontSize = 14,
+                alignment = TextAnchor.MiddleCenter,
+                fixedHeight = 26
+            };
+        }
+
+        var prevBg = GUI.backgroundColor;
+        GUI.backgroundColor = isRemoteNow
+            ? new Color(0.2f, 0.7f, 1f)   // blue for remote
+            : new Color(0.3f, 0.9f, 0.4f); // green for local
+        string label = isRemoteNow ? "REMOTE" : "LOCAL";
+        EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+        m_ModeLabelStyle.normal.textColor = isRemoteNow
+            ? new Color(0.1f, 0.5f, 1f)
+            : new Color(0.1f, 0.6f, 0.2f);
+        EditorGUILayout.LabelField(label, m_ModeLabelStyle);
+        GUI.backgroundColor = prevBg;
+
+        // Compact info line below badge
+        var infoStyle = new GUIStyle(EditorStyles.miniLabel) { alignment = TextAnchor.MiddleCenter };
+        EditorGUILayout.LabelField(
+            isRemoteNow ? "Signal-based wait  |  5s timeout  |  8 retries"
+                        : "Frame-based wait  |  1 frame  |  2 retries",
+            infoStyle);
+        EditorGUILayout.EndVertical();
     }
 
     private void DrawExportButtons()
@@ -560,8 +642,8 @@ public class FrameDebuggerExporter : EditorWindow
         if (m_UtilType == null) return;
 
         int count = GetCount();
-        bool canQuickExport = count > 0 && TryValidateExportPrerequisites(false, out _);
         bool canFullExport = count > 0 && TryValidateExportPrerequisites(true, out _);
+        bool canQuickExport = canFullExport || (count > 0 && TryValidateExportPrerequisites(false, out _));
 
         if (m_AsyncExporting)
         {
@@ -642,6 +724,8 @@ public class FrameDebuggerExporter : EditorWindow
         EditorGUILayout.BeginHorizontal();
         if (GUILayout.Button("Open File"))
             System.Diagnostics.Process.Start(m_LastExportPath);
+        if (GUILayout.Button("Copy Path"))
+            EditorGUIUtility.systemCopyBuffer = m_LastExportPath;
         if (GUILayout.Button("Reveal in Explorer"))
             EditorUtility.RevealInFinder(m_LastExportPath);
         EditorGUILayout.EndHorizontal();
@@ -660,6 +744,20 @@ public class FrameDebuggerExporter : EditorWindow
         m_DiagnoseState = DiagnoseState.Running;
 
         int count = GetCount();
+
+        // Check 0: connection mode
+        bool remote = IsRemoteConnected();
+        string guid = "";
+        if (m_GetRemotePlayerGUID != null)
+        {
+            try { guid = m_GetRemotePlayerGUID.Invoke(null, null)?.ToString() ?? ""; }
+            catch { guid = "error"; }
+        }
+        int diagWait = remote ? 4 : 2;
+        int diagRetry = remote ? 8 : 2;
+        m_DiagnoseResults.Add(("Connection Mode", true,
+            remote ? $"Remote device (GUID={guid})"
+                   : $"Local editor (GUID={guid})"));
 
         // Check 1: API binding
         bool apiOk = m_UtilType != null && m_GetFrameEventData != null && m_EventDataType != null;
@@ -693,37 +791,28 @@ public class FrameDebuggerExporter : EditorWindow
             return;
         }
 
-        // Check 4+5: GPU replay test (async, needs frame delay)
+        // Check 4+5: GPU replay test (async, needs frame delay + retry)
+        // Pick probe indices based on actual event count
+        int probeA = 4;
+        int probeB = Math.Min(count - 1, 49); // don't probe beyond available events
         int restoreLimit = GetLimit();
-        SetLimit(5);
+        SetLimit(probeA + 1);
         UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
 
-        int framesWaited = 0;
-        EditorApplication.CallbackFunction waitAndTest = null;
-        waitAndTest = () =>
+        // Check 4: probe early event
+        ProbeWithRetry(probeA, diagWait, diagRetry, (ok4, vc4, shader4) =>
         {
-            framesWaited++;
-            if (framesWaited < 2) { EditorApplication.delayCall += waitAndTest; return; }
-
-            // Check 4: read event data at limit boundary
-            var (ok4, vc4, shader4) = ProbeEventData(4);
-            m_DiagnoseResults.Add(("GPU Replay (event 4)", ok4,
+            m_DiagnoseResults.Add(($"GPU Replay (event {probeA})", ok4,
                 ok4 ? $"verts={vc4}, shader=\"{shader4}\""
                     : "GetFrameEventData returned false or empty"));
 
-            // Check 5: test at deeper event
-            SetLimit(50);
+            // Check 5: probe deeper event
+            SetLimit(probeB + 1);
             UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
 
-            int framesWaited2 = 0;
-            EditorApplication.CallbackFunction waitAndTest2 = null;
-            waitAndTest2 = () =>
+            ProbeWithRetry(probeB, diagWait, diagRetry, (ok5, vc5, shader5) =>
             {
-                framesWaited2++;
-                if (framesWaited2 < 2) { EditorApplication.delayCall += waitAndTest2; return; }
-
-                var (ok5, vc5, shader5) = ProbeEventData(49);
-                m_DiagnoseResults.Add(("GPU Replay (event 49)", ok5,
+                m_DiagnoseResults.Add(($"GPU Replay (event {probeB})", ok5,
                     ok5 ? $"verts={vc5}, shader=\"{shader5}\""
                         : "GetFrameEventData returned false or empty"));
 
@@ -731,7 +820,7 @@ public class FrameDebuggerExporter : EditorWindow
                 bool fieldOk = false;
                 if (ok5 || ok4)
                 {
-                    int testIdx = ok5 ? 49 : 4;
+                    int testIdx = ok5 ? probeB : probeA;
                     var testData = InvokeGetFrameEventData(testIdx);
                     if (testData != null)
                     {
@@ -750,10 +839,44 @@ public class FrameDebuggerExporter : EditorWindow
                 SetLimit(restoreLimit);
                 m_DiagnoseState = m_DiagnoseResults.TrueForAll(r => r.ok) ? DiagnoseState.Pass : DiagnoseState.Fail;
                 Repaint();
-            };
-            EditorApplication.delayCall += waitAndTest2;
+            });
+        });
+    }
+
+    /// <summary>
+    /// Wait N frames via EditorApplication.delayCall, then invoke the callback.
+    /// </summary>
+    private static void WaitFramesThenRun(int frames, Action callback)
+    {
+        int waited = 0;
+        EditorApplication.CallbackFunction tick = null;
+        tick = () =>
+        {
+            if (++waited < frames) { EditorApplication.delayCall += tick; return; }
+            callback();
         };
-        EditorApplication.delayCall += waitAndTest;
+        EditorApplication.delayCall += tick;
+    }
+
+    /// <summary>
+    /// Wait for GPU replay, then probe event data. Retry up to maxRetries times if data is empty.
+    /// </summary>
+    private void ProbeWithRetry(int index, int waitFrames, int maxRetries,
+        Action<bool, int, string> callback)
+    {
+        WaitFramesThenRun(waitFrames, () =>
+        {
+            var (ok, vc, shader) = ProbeEventData(index);
+            if (!ok && maxRetries > 0)
+            {
+                // Re-trigger replay and retry next frame
+                SetLimit(index + 1);
+                UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
+                ProbeWithRetry(index, 1, maxRetries - 1, callback);
+                return;
+            }
+            callback(ok, vc, shader);
+        });
     }
 
     private (bool ok, int verts, string shader) ProbeEventData(int index)
@@ -865,6 +988,8 @@ public class FrameDebuggerExporter : EditorWindow
 
         m_AsyncIndex = 0;
         m_AsyncPhase = 0;
+        m_AsyncRetryCount = 0;
+        m_AsyncIsRemote = IsRemoteConnected();
         m_AsyncDetailHits = 0;
         m_AsyncExporting = true;
         m_AsyncHeaderWritten = false;
@@ -901,31 +1026,60 @@ public class FrameDebuggerExporter : EditorWindow
             if (m_AsyncPhase == 0)
             {
                 // Phase 0: Set limit and force GPU replay via view repaint
-                if (m_LimitSetterWorks)
-                    SetLimit(i + 1);
-
-                // Force all views to repaint — this triggers the GPU to replay
-                // the frame up to the new limit position
+                SetLimit(i + 1);
                 UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
 
                 m_AsyncPhase = 1;
+                m_AsyncEventStartTime = EditorApplication.timeSinceStartup;
 
                 // Update progress bar
-                if (i % 20 == 0)
-                    EditorUtility.DisplayProgressBar("Async Export",
+                string mode = m_AsyncIsRemote ? "Remote" : "Local";
+                if (i % 5 == 0)
+                    EditorUtility.DisplayProgressBar($"Async Export ({mode})",
                         $"Event {i + 1}/{m_AsyncEventCount} (details: {m_AsyncDetailHits})",
                         (float)i / m_AsyncEventCount);
-                return; // Frame 1: repaint triggered, GPU replay starts
+                return;
             }
 
+            // Phase 1+: wait for data readiness
             if (m_AsyncPhase == 1)
             {
-                // Phase 1: Wait one more frame for GPU replay to complete
-                m_AsyncPhase = 2;
-                return; // Frame 2: GPU replay finishes, data now available
+                double elapsed = EditorApplication.timeSinceStartup - m_AsyncEventStartTime;
+
+                if (m_AsyncIsRemote)
+                {
+                    // Remote: wait for data transfer to complete (signal-based)
+                    bool transferring = IsTransferringData();
+                    if (transferring && elapsed < 5.0)
+                        return; // device still sending, keep waiting (up to 5s)
+                    if (!transferring && elapsed < 0.05)
+                        return; // too early, give device time to start transfer
+                }
+                else
+                {
+                    // Local: 1 frame wait is sufficient
+                    if (elapsed < 0.001)
+                        return;
+                }
+                m_AsyncPhase = 2; // ready to read
             }
 
-            // Phase 2: GPU replay complete — read data for event i
+            // Phase 2: try reading data for event i
+            var eventData = InvokeGetFrameEventData(i);
+
+            // Retry: if read failed, re-trigger replay and wait again (max 8 for remote, 2 for local)
+            int maxRetry = m_AsyncIsRemote ? 8 : 2;
+            if (eventData == null && m_AsyncRetryCount < maxRetry)
+            {
+                m_AsyncRetryCount++;
+                SetLimit(i + 1);
+                UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
+                m_AsyncPhase = 1;
+                m_AsyncEventStartTime = EditorApplication.timeSinceStartup;
+                return;
+            }
+
+            // Write event (with or without detail)
             m_AsyncJson.BeginObject();
             m_AsyncJson.Key("index").Value(i);
             WriteEventName(m_AsyncJson, i);
@@ -933,18 +1087,13 @@ public class FrameDebuggerExporter : EditorWindow
             if (m_AsyncFrameEventsArray != null && i < m_AsyncFrameEventsArray.Length)
                 evtType = WriteBasicEventInfo(m_AsyncJson, m_AsyncFrameEventsArray.GetValue(i), i);
 
-            // Clean, structured per-event detail
-            if (m_GetFrameEventData != null && m_EventDataType != null)
+            if (eventData != null)
             {
-                var eventData = InvokeGetFrameEventData(i);
-                if (eventData != null)
-                {
-                    m_AsyncJson.Key("detail");
-                    WriteCleanDetail(m_AsyncJson, eventData, evtType);
-                    CollectStats(eventData, i);
-                    SelfCheckEventData(eventData, evtType);
-                    m_AsyncDetailHits++;
-                }
+                m_AsyncJson.Key("detail");
+                WriteCleanDetail(m_AsyncJson, eventData, evtType);
+                CollectStats(eventData, i);
+                SelfCheckEventData(eventData, evtType);
+                m_AsyncDetailHits++;
             }
 
             m_AsyncJson.EndObject();
@@ -952,6 +1101,7 @@ public class FrameDebuggerExporter : EditorWindow
             // Move to next event
             m_AsyncIndex = i + 1;
             m_AsyncPhase = 0;
+            m_AsyncRetryCount = 0;
 
             if (m_AsyncIndex >= m_AsyncEventCount)
                 StopAsyncExport(false);
@@ -1578,9 +1728,7 @@ public class FrameDebuggerExporter : EditorWindow
 
         // Shader distribution
         json.Key("shaderDistribution").BeginArray();
-        var sortedShaders = new List<KeyValuePair<string, int>>(m_ShaderDrawCalls);
-        sortedShaders.Sort((a, b) => b.Value.CompareTo(a.Value));
-        foreach (var kvp in sortedShaders)
+        foreach (var kvp in SortedDescending(m_ShaderDrawCalls))
         {
             json.BeginObject();
             json.Key("shader").Value(kvp.Key);
@@ -1593,35 +1741,11 @@ public class FrameDebuggerExporter : EditorWindow
 
         // Batch break causes
         if (m_BatchBreakCauses.Count > 0)
-        {
-            json.Key("batchBreakCauses").BeginArray();
-            var sorted = new List<KeyValuePair<string, int>>(m_BatchBreakCauses);
-            sorted.Sort((a, b) => b.Value.CompareTo(a.Value));
-            foreach (var kvp in sorted)
-            {
-                json.BeginObject();
-                json.Key("cause").Value(kvp.Key);
-                json.Key("count").Value(kvp.Value);
-                json.EndObject();
-            }
-            json.EndArray();
-        }
+            WriteSortedDistribution(json, "batchBreakCauses", "cause", m_BatchBreakCauses);
 
         // Event type distribution
         if (m_EventTypeCounts.Count > 0)
-        {
-            json.Key("eventTypeDistribution").BeginArray();
-            var sorted = new List<KeyValuePair<string, int>>(m_EventTypeCounts);
-            sorted.Sort((a, b) => b.Value.CompareTo(a.Value));
-            foreach (var kvp in sorted)
-            {
-                json.BeginObject();
-                json.Key("type").Value(kvp.Key);
-                json.Key("count").Value(kvp.Value);
-                json.EndObject();
-            }
-            json.EndArray();
-        }
+            WriteSortedDistribution(json, "eventTypeDistribution", "type", m_EventTypeCounts);
 
         // Render target timeline
         if (m_RTTimeline != null && m_RTTimeline.Count > 0)
@@ -1648,6 +1772,27 @@ public class FrameDebuggerExporter : EditorWindow
     #endregion
 
     #region Helpers
+
+    private static List<KeyValuePair<string, int>> SortedDescending(Dictionary<string, int> dict)
+    {
+        var list = new List<KeyValuePair<string, int>>(dict);
+        list.Sort((a, b) => b.Value.CompareTo(a.Value));
+        return list;
+    }
+
+    private void WriteSortedDistribution(JsonBuilder json, string arrayKey, string itemKey,
+        Dictionary<string, int> dict)
+    {
+        json.Key(arrayKey).BeginArray();
+        foreach (var kvp in SortedDescending(dict))
+        {
+            json.BeginObject();
+            json.Key(itemKey).Value(kvp.Key);
+            json.Key("count").Value(kvp.Value);
+            json.EndObject();
+        }
+        json.EndArray();
+    }
 
     private FieldInfo CachedField(Type type, string name)
     {
