@@ -84,7 +84,11 @@ Click **Diagnose Limit Setter**. A color-coded checklist shows if the tool works
 | **Quick Export** | Instant | Event names, types, GameObjects |
 | **Full Export** | ~1s per event | All detail: shader, state, render target, properties |
 
-Output: `{ProjectRoot}/FrameDebuggerExports/fd_{mode}_{timestamp}.json`
+Output: `{ProjectRoot}/FrameDebuggerExports/fd_{target}_{app}_{timestamp}.json`
+
+- `target`: `editor` (local) or `android`/`ios` (remote)
+- `app`: your `Application.productName`
+- Example: `fd_editor_MyGame_20260318_141636_753.json`
 
 ### 5. Analyze
 
@@ -328,7 +332,11 @@ git clone https://github.com/sputnicyoji/unity-frame-dump.git com.sputnicyoji.un
 | **Quick Export** | 立即 | 事件名、类型、GameObject | 快速概览 |
 | **Full Export** | ~1s/事件 | Shader/状态/RT/属性等完整详情 | 深度分析 |
 
-输出文件保存在: `{项目根目录}/FrameDebuggerExports/fd_{mode}_{timestamp}.json`
+输出文件保存在: `{项目根目录}/FrameDebuggerExports/fd_{target}_{app}_{timestamp}.json`
+
+- `target`: `editor` (本地) 或 `android`/`ios` (远程设备)
+- `app`: Player Settings 中的 `Application.productName`
+- 示例: `fd_editor_MyGame_20260318_141636_753.json`
 
 导出完成后，窗口底部会显示 **Open File** 和 **Reveal in Explorer** 按钮。
 

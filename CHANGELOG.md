@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.2] - 2026-03-18
+
+### Fixed
+- **Local export data loss on slow machines**: Replaced fixed 2-retry with timeout-based polling (up to 2s per event). GPU replay is no longer redundantly re-triggered on retry — the tool simply waits for the in-progress replay to complete. Fast machines see no change; slow machines get complete data.
+
+### Changed
+- **Export filename**: `fd_{target}_{app}_{timestamp}.json` — includes `editor`/`android`/`ios` target and app name for easy identification
+- **JSON `exportMode`**: Renamed from `"async"` to `"full"`
+
+### Added
+- **Version label**: Package version displayed in the exporter window (top-right corner)
+
 ## [1.1.1] - 2026-03-18
 
 ### Fixed

@@ -524,9 +524,33 @@ public class FrameDebuggerExporter : EditorWindow
         json.EndObject();
     }
 
-    private static string GetUniqueExportPath(string dir, string mode)
+    private string GetExportTarget()
     {
-        string baseName = $"fd_{mode}_{DateTime.Now:yyyyMMdd_HHmmss_fff}";
+        if (!IsEffectivelyRemote())
+            return "editor";
+        // Use active build target as platform hint for remote device
+        string target = EditorUserBuildSettings.activeBuildTarget.ToString().ToLowerInvariant();
+        // Shorten common names
+        if (target.Contains("android")) return "android";
+        if (target.Contains("ios")) return "ios";
+        if (target.Contains("standalone")) return "standalone";
+        return target;
+    }
+
+    private static string SanitizeFileName(string name)
+    {
+        char[] invalid = Path.GetInvalidFileNameChars();
+        var sb = new StringBuilder(name.Length);
+        foreach (char c in name)
+            sb.Append(Array.IndexOf(invalid, c) >= 0 ? '_' : c);
+        return sb.ToString();
+    }
+
+    private string GetUniqueExportPath(string dir)
+    {
+        string target = GetExportTarget();
+        string app = SanitizeFileName(Application.productName);
+        string baseName = $"fd_{target}_{app}_{DateTime.Now:yyyyMMdd_HHmmss_fff}";
         string fullPath = Path.GetFullPath(Path.Combine(dir, $"{baseName}.json"));
         int suffix = 1;
         while (File.Exists(fullPath))
@@ -579,9 +603,46 @@ public class FrameDebuggerExporter : EditorWindow
 
     #region GUI
 
+    private static string s_PackageVersion;
+
+    private static string GetPackageVersion()
+    {
+        if (s_PackageVersion != null) return s_PackageVersion;
+        try
+        {
+            var guids = AssetDatabase.FindAssets("package t:TextAsset",
+                new[] { "Packages/com.sputnicyoji.unity-frame-dump" });
+            foreach (var guid in guids)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                if (!path.EndsWith("package.json")) continue;
+                string json = File.ReadAllText(path);
+                // Minimal parse: find "version": "x.y.z"
+                int idx = json.IndexOf("\"version\"");
+                if (idx < 0) break;
+                int q1 = json.IndexOf('"', idx + 9);
+                int q2 = json.IndexOf('"', q1 + 1);
+                if (q1 >= 0 && q2 > q1)
+                {
+                    s_PackageVersion = json.Substring(q1 + 1, q2 - q1 - 1);
+                    return s_PackageVersion;
+                }
+            }
+        }
+        catch { /* ignore */ }
+        s_PackageVersion = "?";
+        return s_PackageVersion;
+    }
+
     private void OnGUI()
     {
         m_ScrollPos = EditorGUILayout.BeginScrollView(m_ScrollPos);
+
+        // Version label — right-aligned, subtle
+        EditorGUILayout.BeginHorizontal();
+        GUILayout.FlexibleSpace();
+        EditorGUILayout.LabelField($"v{GetPackageVersion()}", EditorStyles.miniLabel, GUILayout.Width(50));
+        EditorGUILayout.EndHorizontal();
 
         DrawStatus();
         EditorGUILayout.Space(8);
@@ -1001,7 +1062,7 @@ public class FrameDebuggerExporter : EditorWindow
         WriteIssues(json);
         json.EndObject();
 
-        SaveExport(sb, eventCount, "quick");
+        SaveExport(sb, eventCount);
     }
 
     /// <summary>
@@ -1080,7 +1141,7 @@ public class FrameDebuggerExporter : EditorWindow
             {
                 m_AsyncJson.BeginObject();
                 WriteHeader(m_AsyncJson, m_AsyncEventCount);
-                m_AsyncJson.Key("exportMode").Value("async");
+                m_AsyncJson.Key("exportMode").Value("full");
                 m_AsyncJson.Key("events").BeginArray();
                 m_AsyncHeaderWritten = true;
             }
@@ -1131,16 +1192,33 @@ public class FrameDebuggerExporter : EditorWindow
             // Phase 2: try reading data for event i
             var eventData = InvokeGetFrameEventData(i);
 
-            // Retry: if read failed, re-trigger replay and wait again (max 8 for remote, 2 for local)
-            int maxRetry = m_AsyncIsRemote ? 8 : 2;
-            if (eventData == null && m_AsyncRetryCount < maxRetry)
+            if (eventData == null)
             {
-                m_AsyncRetryCount++;
-                SetLimit(i + 1);
-                UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
-                m_AsyncPhase = 1;
-                m_AsyncEventStartTime = EditorApplication.timeSinceStartup;
-                return;
+                double elapsed = EditorApplication.timeSinceStartup - m_AsyncEventStartTime;
+
+                if (m_AsyncIsRemote)
+                {
+                    // Remote: re-trigger replay and wait for transfer signal (up to 8 retries)
+                    if (m_AsyncRetryCount < 8)
+                    {
+                        m_AsyncRetryCount++;
+                        SetLimit(i + 1);
+                        UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
+                        m_AsyncPhase = 1;
+                        m_AsyncEventStartTime = EditorApplication.timeSinceStartup;
+                        return;
+                    }
+                }
+                else
+                {
+                    // Local: poll next frame without re-triggering replay (GPU is already processing)
+                    if (elapsed < 2.0)
+                    {
+                        m_AsyncRetryCount++;
+                        return; // stay in phase 2, retry next editor frame
+                    }
+                    Debug.LogWarning($"[FDExporter] Event {i} timed out after {elapsed:F2}s ({m_AsyncRetryCount} polls)");
+                }
             }
 
             // Write event (with or without detail)
@@ -1207,7 +1285,7 @@ public class FrameDebuggerExporter : EditorWindow
         WriteIssues(m_AsyncJson);
         m_AsyncJson.EndObject();
 
-        SaveExport(m_AsyncSb, m_AsyncEventCount, "async");
+        SaveExport(m_AsyncSb, m_AsyncEventCount);
 
         m_AsyncExporting = false;
         Repaint();
@@ -1247,16 +1325,17 @@ public class FrameDebuggerExporter : EditorWindow
         }
     }
 
-    private void SaveExport(StringBuilder sb, int eventCount, string mode)
+    private void SaveExport(StringBuilder sb, int eventCount)
     {
         string dir = Path.Combine(Application.dataPath, "..", "FrameDebuggerExports");
         Directory.CreateDirectory(dir);
-        string fullPath = GetUniqueExportPath(dir, mode);
+        string fullPath = GetUniqueExportPath(dir);
         File.WriteAllText(fullPath, sb.ToString(), Encoding.UTF8);
 
         m_LastExportPath = fullPath;
 
         var fileInfo = new FileInfo(fullPath);
+        string target = GetExportTarget();
         string summaryLine = m_LastSummaryAvailable
             ? $"Draw Calls: {m_DrawCallCount}\n" +
               $"Total Vertices: {m_TotalVertices:N0}\n" +
@@ -1268,7 +1347,7 @@ public class FrameDebuggerExporter : EditorWindow
             : "\nIssues: 0\n";
 
         EditorUtility.DisplayDialog("Export Complete",
-            $"Mode: {mode}\n" +
+            $"Target: {target}\n" +
             $"Events: {eventCount}\n" +
             summaryLine +
             issueLine +
