@@ -38,6 +38,7 @@ public class FrameDebuggerExporter : EditorWindow
     #region Reflection Cache
 
     private Type m_UtilType;
+    private Type m_FrameDebuggerType;  // FrameDebugger (not Utility) — has IsLocalEnabled/IsRemoteEnabled
     private Type m_EventDataType;
     private Type m_EventType;
 
@@ -53,7 +54,9 @@ public class FrameDebuggerExporter : EditorWindow
     private PropertyInfo m_PropLimit;
     private MethodInfo m_SetLimitMethod;  // cached set_limit fallback
     private PropertyInfo m_PropReceivingRemote; // receivingRemoteFrameEventData
-    private MethodInfo m_GetRemotePlayerGUID;   // stable remote connection check
+    private MethodInfo m_GetRemotePlayerGUID;   // GUID-based remote check (unreliable — persists after disconnect)
+    private MethodInfo m_IsLocalEnabled;         // FrameDebugger.IsLocalEnabled() — reflects actual dropdown state
+    private MethodInfo m_IsRemoteEnabled;        // FrameDebugger.IsRemoteEnabled()
 
     // Cached batch break cause lookup table
     private string[] m_BatchBreakCauseStrings;
@@ -79,6 +82,9 @@ public class FrameDebuggerExporter : EditorWindow
     #endregion
 
     #region UI State
+
+    private enum ConnectionMode { Auto, ForceLocal, ForceRemote }
+    private ConnectionMode m_ConnectionMode = ConnectionMode.Auto;
 
     private string m_LastExportPath;
     private Vector2 m_ScrollPos;
@@ -160,7 +166,7 @@ public class FrameDebuggerExporter : EditorWindow
     private void OnEnable()
     {
         DiscoverTypes();
-        m_LastRemoteState = IsRemoteConnected();
+        m_LastRemoteState = IsEffectivelyRemote();
     }
 
     private void OnDisable()
@@ -193,6 +199,11 @@ public class FrameDebuggerExporter : EditorWindow
                     if (m_EventType == null && type.Name == "FrameDebuggerEvent"
                                             && !type.Name.Contains("Data"))
                         m_EventType = type;
+
+                    if (m_FrameDebuggerType == null && type.Name == "FrameDebugger"
+                                                    && !type.Name.Contains("Utility")
+                                                    && !type.Name.Contains("Event"))
+                        m_FrameDebuggerType = type;
                 }
             }
             catch (ReflectionTypeLoadException) { }
@@ -212,6 +223,10 @@ public class FrameDebuggerExporter : EditorWindow
             m_PropReceivingRemote = m_UtilType.GetProperty("receivingRemoteFrameEventData", s_Static);
             m_GetRemotePlayerGUID = m_UtilType.GetMethod("GetRemotePlayerGUID", s_Static);
 
+            // Try IsLocalEnabled/IsRemoteEnabled on FrameDebuggerUtility first
+            m_IsLocalEnabled = m_UtilType.GetMethod("IsLocalEnabled", s_Static);
+            m_IsRemoteEnabled = m_UtilType.GetMethod("IsRemoteEnabled", s_Static);
+
             // Pre-cache batch break cause strings
             if (m_GetBatchBreakCauseStrings != null)
             {
@@ -225,6 +240,13 @@ public class FrameDebuggerExporter : EditorWindow
                         $"Failed to read batch break cause strings: {e.GetType().Name}: {e.Message}");
                 }
             }
+        }
+
+        // Fallback: look on FrameDebugger type (Unity 2022.3 puts them here)
+        if (m_IsLocalEnabled == null && m_FrameDebuggerType != null)
+        {
+            m_IsLocalEnabled = m_FrameDebuggerType.GetMethod("IsLocalEnabled", s_Static);
+            m_IsRemoteEnabled = m_FrameDebuggerType.GetMethod("IsRemoteEnabled", s_Static);
         }
 
         // Cache FrameDebuggerEvent field infos
@@ -269,23 +291,48 @@ public class FrameDebuggerExporter : EditorWindow
     }
 
     /// <summary>
-    /// Stable remote connection check via GetRemotePlayerGUID.
-    /// Returns true if Frame Debugger is connected to a remote device.
+    /// Auto-detect whether Frame Debugger targets a remote device.
+    /// Priority: IsRemoteEnabled() API > GUID heuristic (fallback).
     /// </summary>
     private bool IsRemoteConnected()
     {
+        // Primary: IsLocalEnabled/IsRemoteEnabled — reflects the actual dropdown state
+        if (m_IsRemoteEnabled != null)
+        {
+            try
+            {
+                var val = m_IsRemoteEnabled.Invoke(null, null);
+                if (val is bool b) return b;
+            }
+            catch { /* fall through to GUID */ }
+        }
+
+        // Fallback: GUID heuristic (unreliable — persists after device disconnect)
         if (m_GetRemotePlayerGUID == null) return false;
         try
         {
             var guid = m_GetRemotePlayerGUID.Invoke(null, null);
             if (guid == null) return false;
             string s = guid.ToString();
-            // Empty or all-zero GUID = local
             return !string.IsNullOrEmpty(s) && s != "0000000000000000"
                 && s != "00000000000000000000000000000000"
                 && s != "00000000-0000-0000-0000-000000000000";
         }
         catch { return false; }
+    }
+
+    /// <summary>
+    /// Effective remote state considering user override.
+    /// Auto = API detection, ForceLocal/ForceRemote = user override.
+    /// </summary>
+    private bool IsEffectivelyRemote()
+    {
+        switch (m_ConnectionMode)
+        {
+            case ConnectionMode.ForceLocal:  return false;
+            case ConnectionMode.ForceRemote: return true;
+            default:                         return IsRemoteConnected();
+        }
     }
 
     /// <summary>
@@ -600,8 +647,7 @@ public class FrameDebuggerExporter : EditorWindow
 
     private void DrawOptions()
     {
-        // Auto-detect remote state change
-        bool isRemoteNow = IsRemoteConnected();
+        bool isRemoteNow = IsEffectivelyRemote();
         if (isRemoteNow != m_LastRemoteState)
             m_LastRemoteState = isRemoteNow;
 
@@ -628,11 +674,25 @@ public class FrameDebuggerExporter : EditorWindow
         EditorGUILayout.LabelField(label, m_ModeLabelStyle);
         GUI.backgroundColor = prevBg;
 
+        // Connection mode override
+        EditorGUILayout.BeginHorizontal();
+        EditorGUILayout.PrefixLabel("Connection");
+        var newMode = (ConnectionMode)EditorGUILayout.EnumPopup(m_ConnectionMode);
+        if (newMode != m_ConnectionMode)
+        {
+            m_ConnectionMode = newMode;
+            Repaint();
+        }
+        EditorGUILayout.EndHorizontal();
+
         // Compact info line below badge
         var infoStyle = new GUIStyle(EditorStyles.miniLabel) { alignment = TextAnchor.MiddleCenter };
+        string autoHint = m_ConnectionMode != ConnectionMode.Auto
+            ? $"  (auto-detect: {(IsRemoteConnected() ? "remote" : "local")})"
+            : "";
         EditorGUILayout.LabelField(
-            isRemoteNow ? "Signal-based wait  |  5s timeout  |  8 retries"
-                        : "Frame-based wait  |  1 frame  |  2 retries",
+            (isRemoteNow ? "Signal-based wait  |  5s timeout  |  8 retries"
+                         : "Frame-based wait  |  1 frame  |  2 retries") + autoHint,
             infoStyle);
         EditorGUILayout.EndVertical();
     }
@@ -746,7 +806,7 @@ public class FrameDebuggerExporter : EditorWindow
         int count = GetCount();
 
         // Check 0: connection mode
-        bool remote = IsRemoteConnected();
+        bool remote = IsEffectivelyRemote();
         string guid = "";
         if (m_GetRemotePlayerGUID != null)
         {
@@ -755,9 +815,13 @@ public class FrameDebuggerExporter : EditorWindow
         }
         int diagWait = remote ? 4 : 2;
         int diagRetry = remote ? 8 : 2;
+        string detectionMethod = m_IsRemoteEnabled != null ? "API" : "GUID-fallback";
+        string overrideInfo = m_ConnectionMode != ConnectionMode.Auto
+            ? $", override={m_ConnectionMode}" : "";
         m_DiagnoseResults.Add(("Connection Mode", true,
-            remote ? $"Remote device (GUID={guid})"
-                   : $"Local editor (GUID={guid})"));
+            (remote ? $"Remote (GUID={guid})"
+                    : $"Local (GUID={guid})")
+            + $" [detect: {detectionMethod}{overrideInfo}]"));
 
         // Check 1: API binding
         bool apiOk = m_UtilType != null && m_GetFrameEventData != null && m_EventDataType != null;
@@ -989,7 +1053,7 @@ public class FrameDebuggerExporter : EditorWindow
         m_AsyncIndex = 0;
         m_AsyncPhase = 0;
         m_AsyncRetryCount = 0;
-        m_AsyncIsRemote = IsRemoteConnected();
+        m_AsyncIsRemote = IsEffectivelyRemote();
         m_AsyncDetailHits = 0;
         m_AsyncExporting = true;
         m_AsyncHeaderWritten = false;

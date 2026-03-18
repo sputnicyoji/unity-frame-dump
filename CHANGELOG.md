@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.1] - 2026-03-18
+
+### Fixed
+- **Connection mode stuck on Remote**: `GetRemotePlayerGUID` GUID persists after device disconnect, causing permanent Remote mode. Now uses `FrameDebugger.IsRemoteEnabled()` API as primary detection, with GUID as fallback.
+
+### Added
+- **Manual connection override**: `Auto / Force Local / Force Remote` dropdown in UI, overrides auto-detection when needed
+- **Diagnose detection info**: Shows detection method (`API` vs `GUID-fallback`) and override state
+
 ## [1.1.0] - 2026-03-17
 
 ### Added
